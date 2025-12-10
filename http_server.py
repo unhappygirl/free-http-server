@@ -355,6 +355,7 @@ class WebServer(HttpServer):
     async def handle_response(self, request):
         # look up the action table
         action = self.action_callback.get(request.requested_url.path, None)
+        action_result = None
         if action:
             try:
                 action_result = action(request)
