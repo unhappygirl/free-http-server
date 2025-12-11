@@ -87,6 +87,7 @@ class Server:
 class HTTPResponse:
     status_code: int
     status_phrase: str
+    top: str
     headers: dict
     body: bytes
     mimetype: str
@@ -130,6 +131,14 @@ class HttpServer(Server):
     </html>
     """,
 
+        405: b"""
+    <!DOCTYPE html>
+    <html>
+    <h1> 405 Method Not Allowed </h1>
+    <p> The requested method is not allowed for the requested resource. </p>
+    </html>
+    """,
+
         400: b"""
     <!DOCTYPE html> 
     <html> 
@@ -152,15 +161,14 @@ class HttpServer(Server):
 
     def __init__(self, addr=None, port=8000, logging=False, debug=False, version="1.1"):
         super().__init__(addr, port, logging, debug)
-        self.allowed_requests = ["GET", "POST"]
         self.version = version
-        self.callbacks = []
 
     @staticmethod
     def get_ext(filename):
         sep = b"." if type(filename) is bytes else "."
         return "." + filename.split(sep)[-1]
 
+    # parses the request and returns an HTTPRequest object
     @classmethod
     def parse_request_headers(cls, raw_request: bytes) -> HTTPRequest:
         fields = raw_request.split(cls.CRLF)
@@ -176,27 +184,25 @@ class HttpServer(Server):
                           method=method, requested_url=cls.parse_url(URI))
         return req
 
-    def parse_body(self, raw_request: bytes) -> HTTPRequest:
+    def parse_body(self, request: HTTPRequest) -> HTTPRequest:
         pass
 
     def dead_message(self, msg):
         return msg == b''
 
     # prepare response headers
-    def prepare_headers(self, response: HTTPResponse):
-        # placeholder
+    def prepare_headers(self, request: HTTPRequest, response: HTTPResponse):
+        # placeholder # to do complete
         top = f"HTTP/{self.version} {response.status_code} {response.status_phrase}\r\n"
         headers = {
             "Content-Type": f"{response.mimetype}; charset=utf-8",
             "Server": "Free-HTTP-Server",
-            "Allow": ", ".join(self.allowed_requests),
+            "Allow": "GET, POST",
             "Connection": "close",
             "Content-Length": str(len(response.body))
         }
-
-        headers_str = (self.CRLF.decode()).join([f"{key}: {value}" for key,
-                                                 value in headers.items()])
-        return self.encode_str(top + headers_str)
+        response.top = top
+        response.headers = headers
 
     def valid_request(self, request: HTTPRequest):
         # placeholder
@@ -206,13 +212,10 @@ class HttpServer(Server):
         s = http.HTTPStatus
         if type(self) is HttpServer:
             status = s.NOT_IMPLEMENTED
-        if not self.valid_request(request):
+        elif not self.valid_request(request):
             status = s.BAD_REQUEST
         elif response_body is None:
             status = s.NOT_FOUND
-        elif request.method.decode() not in self.allowed_requests:
-            print(request.method.decode(), "lol")
-            status = s.METHOD_NOT_ALLOWED
         else:
             status = s.OK
 
@@ -223,6 +226,7 @@ class HttpServer(Server):
         pass
 
     def finalize_body(self, response):
+        # status code is not erronous
         if response.status_code in [200, ]:
             return response.body
         body = self.ERROR_STATUS_HTML[response.status_code]
@@ -240,17 +244,17 @@ class HttpServer(Server):
 
     def construct_response(self, request, filename, body):
         code, phrase = self.status_resolution(request, response_body=body)
-        response = HTTPResponse(code, phrase, None, body,
+        response = HTTPResponse(code, phrase, None, None, body,
                                 self.mimetype_resolution(filename))
         response.body = self.finalize_body(response)
-        headers = self.prepare_headers(response)
-        response.headers = headers
+        self.prepare_headers(request, response)
         return response
 
     @classmethod
     def raw_response(cls, http_response: HTTPResponse):
-        return \
-            http_response.headers \
+        headers_str = (cls.CRLF.decode()).join([f"{key}: {value}" for key,
+                                                value in http_response.headers.items()])
+        return cls.encode_str(http_response.top) + cls.encode_str(headers_str) \
             + cls.CRLF*2 \
             + http_response.body
 
@@ -265,6 +269,7 @@ class HttpServer(Server):
     async def handle_request(self, reader, headers):
         req = self.parse_request_headers(headers)
         content_length = int(req.headers.get(b"Content-Length", 0))
+        # initialize body if any
         if content_length > 0:
             body = await self.recv_request_body(reader, content_length=content_length)
             req.body = body
@@ -284,6 +289,7 @@ class HttpServer(Server):
             # read returned b'' connection ends
             self.logger.info(f"Client {client_id} disconnected!")
             return True
+        # get the request object
         req = await self.handle_request(r, headers)
         self.logger.debug(
             f"Received request from {client_id}: {req.method} {req.requested_url.path}")
@@ -322,6 +328,14 @@ class WebServer(HttpServer):
         super().__init__(addr, port, logging, debug, http_version)
         self.action_callback = action_callback
 
+    def get_allowed_requests(self, path):
+        in_mapping = path in self.loc_resource
+        if in_mapping:
+            _, allowed = self.loc_resource[path]
+            return allowed
+        else:
+            return ['GET', ]
+
     def get_info_from_url(self, url: ParsedURL):
         in_mapping = url.path in self.loc_resource
         if not in_mapping:
@@ -337,6 +351,15 @@ class WebServer(HttpServer):
 
         return filepath, filename, in_mapping
 
+    def status_resolution(self, request: HTTPRequest, response_body: bytes):
+        code, phrase = super().status_resolution(request, response_body)
+        # additional resolution for checking method allowance
+        allowed = self.get_allowed_requests(request.requested_url.path)
+        if request.method.decode() not in allowed:
+            code = http.HTTPStatus.METHOD_NOT_ALLOWED.value
+            phrase = http.HTTPStatus.METHOD_NOT_ALLOWED.phrase
+        return code, phrase
+
     def resource_resolution(self, request: HTTPRequest):
         filepath, filename, in_mapping = self.get_info_from_url(
             request.requested_url)
@@ -350,11 +373,13 @@ class WebServer(HttpServer):
                 return None
             data = file.read()
             return data, filename
-        return self.loc_resource[request.requested_url.path], filename
+        return self.loc_resource[request.requested_url.path][0], filename
 
     async def handle_response(self, request):
         # look up the action table
-        action = self.action_callback.get(request.requested_url.path, None)
+        # action is None if none is found for the path
+        action = self.action_callback.get(
+            request.requested_url.path, None)
         action_result = None
         if action:
             try:
@@ -365,16 +390,22 @@ class WebServer(HttpServer):
 
         if (resources := self.resource_resolution(request)):
             body, filename = resources
-            # if action result is overriding mapping
+            # action result is overriding mapping?
             body = action_result if action_result is not None else body
         else:
             if resources is None:
                 body = None
                 filename = None
-        
+
         response = self.construct_response(
             request, filename=filename, body=body)
         return response
+
+    def prepare_headers(self, request, response):
+        super().prepare_headers(request, response)
+        # edit the allow field
+        response.headers["Allow"] = ", ".join(self.get_allowed_requests(
+            request.requested_url.path))
 
     def look_up_action(self, request):
         return self.action_callback.get(
@@ -384,10 +415,6 @@ class WebServer(HttpServer):
         if not callable(action):
             raise TypeError(f"action object must be callable!")
         self.action_callback[path] = action
-
-
-
-        
 
 
 def main():
@@ -401,22 +428,22 @@ def main():
                 <p> This is a minimalistic HTTP server implementation in Python. Enjoy your stay! </p>
                 </html>
                 """.encode()
-                
+
     loc_mapping = {
-        "/": b"""
+        "/": (b"""
         <!DOCTYPE html>
         <html>
         <h1> Welcome to Free-HTTP-Server! </h1>
         <p> This is a minimalistic HTTP server implementation in Python. Enjoy your stay! </p>
         </html>
-        """,
-        "/hello_world": b"""
+        """, 'GET'),
+        "/hello_world": (b"""
         <!DOCTYPE html>
         <html>
         <h1> Welcome to Free-HTTP-Server! </h1>
         <p> Hello world! </p>
         </html>
-        """
+        """, 'GET')
     }
     server = WebServer(port=31331, logging=True, debug=True,
                        root_dir="./www", loc_mapping=loc_mapping)
