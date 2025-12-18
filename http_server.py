@@ -1,13 +1,15 @@
 
-
+from urllib.parse import ParseResult
+from dataclasses import dataclass
+from typing import Union
+import mimetypes
 import asyncio
 import logging
-import mimetypes
-import http
 import urllib
-from urllib.parse import ParseResult
+import http
+import json
 import os
-from dataclasses import dataclass
+import re
 
 
 # A more general and absract Server concept for the precursor of our HTTP server
@@ -103,8 +105,9 @@ class ParsedURL():
         self.path = pr.path
         self.params = pr.params
         if pr.query:
-            self.query = dict(f.split('=')
-                              for f in pr.query.split('&'))
+            q = pr.query
+            q = q.replace('+', ' ')
+            self.query = dict(f.split('=') for f in q)
         else:
             self.query = pr.query
         self.fragment = pr.fragment
@@ -114,9 +117,35 @@ class ParsedURL():
 @dataclass
 class HTTPRequest:
     headers: dict
-    body: bytes
+    raw_headers: bytes
+    body: Union[tuple, str, bytes]
     method: str
     requested_url: ParsedURL
+
+
+METHOD = r"(?:GET|POST|DELETE|PUT|OPTIONS|HEAD)"
+
+# RFC-ish token for header field-name
+FIELD_NAME = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+
+# "obs-text" allowed in field-value in HTTP/1.1;
+# any VCHAR / obs-text / SP / HTAB, but never CR or LF
+FIELD_VALUE = r"[ \t\x21-\x7E\x80-\xFF]*"
+
+# request-target: practical form = "any non-space"
+# (covers origin-form, absolute-form, authority-form, asterisk-form)
+REQUEST_TARGET = r"[^\s]+"
+
+HTTP_VERSION = r"HTTP/[0-9]+\.[0-9]+"
+
+REQUEST_HEAD_RE = re.compile(
+    rf"\A"
+    rf"(?P<method>{METHOD})[ ]+(?P<target>{REQUEST_TARGET})[ ]+(?P<version>{HTTP_VERSION})\r\n"
+    rf"(?P<headers>(?:{FIELD_NAME}:[ \t]*{FIELD_VALUE}\r\n)*)"
+    rf"\r\n"
+    rf"\Z",
+    re.ASCII
+)
 
 
 class HttpServer(Server):
@@ -180,12 +209,30 @@ class HttpServer(Server):
                 continue
             key, value = field.split(b": ")
             fields_dict[key] = value
-        req = HTTPRequest(headers=fields_dict, body=b"",
+        req = HTTPRequest(headers=fields_dict, raw_headers=raw_request, body=b"",
                           method=method, requested_url=cls.parse_url(URI))
         return req
 
-    def parse_body(self, request: HTTPRequest) -> HTTPRequest:
-        pass
+    def parse_request_body(self, request: HTTPRequest) -> HTTPRequest:
+        content_type = request.headers[b"Content-Type"].decode()
+        if not content_type:
+            return None
+        body = request.body.decode()
+        if content_type == "application/x-www-form-urlencoded":
+            # insert spaces
+            body = body.replace('+', ' ')
+            request.body = dict(f.split('=')
+                                for f in body.split('&'))
+
+        elif content_type.startswith("multipart/form-data"):
+            # to do: implement multipart parsing
+            pass
+        elif content_type == "application/json":
+            request.body = json.loads(body)
+        elif content_type.startswith("text/"):
+            request.body = body.decode()
+        elif content_type == "application/octet-stream":
+            pass
 
     def dead_message(self, msg):
         return msg == b''
@@ -204,16 +251,16 @@ class HttpServer(Server):
         response.top = top
         response.headers = headers
 
-    def valid_request(self, request: HTTPRequest):
+    def valid_request(self, headers: bytes):
         # placeholder
-        return True
+        return REQUEST_HEAD_RE.fullmatch(headers.decode())
 
-    def status_resolution(self, request: HTTPRequest, response_body: bytes):
+    def status_resolution(self, request: HTTPRequest | None, response_body: bytes):
         s = http.HTTPStatus
-        if type(self) is HttpServer:
-            status = s.NOT_IMPLEMENTED
-        elif not self.valid_request(request):
+        if request is None:
             status = s.BAD_REQUEST
+        elif type(self) is HttpServer:
+            status = s.NOT_IMPLEMENTED
         elif response_body is None:
             status = s.NOT_FOUND
         else:
@@ -267,12 +314,15 @@ class HttpServer(Server):
         return body
 
     async def handle_request(self, reader, headers):
+        if not self.valid_request(headers):
+            return None
         req = self.parse_request_headers(headers)
+        # for checking validity
         content_length = int(req.headers.get(b"Content-Length", 0))
         # initialize body if any
         if content_length > 0:
-            body = await self.recv_request_body(reader, content_length=content_length)
-            req.body = body
+            req.body = await self.recv_request_body(reader, content_length=content_length)
+            self.parse_request_body(req)
         return req
 
     async def handle_response(self, request):
@@ -291,8 +341,13 @@ class HttpServer(Server):
             return True
         # get the request object
         req = await self.handle_request(r, headers)
-        self.logger.debug(
-            f"Received request from {client_id}: {req.method} {req.requested_url.path}")
+        if req:
+            self.logger.debug(
+                f"Received request from {client_id}:\
+                    {req.method} {req.requested_url.path}, body: {req.body}, headers: {req.headers}")
+        else:
+            self.logger.warning(f"Received invalid request from {client_id}!")
+            
         response = await self.handle_response(req)
 
         await self.send_to(w, self.raw_response(response))
@@ -351,9 +406,12 @@ class WebServer(HttpServer):
 
         return filepath, filename, in_mapping
 
+    # additional resolution for checking method allowance
     def status_resolution(self, request: HTTPRequest, response_body: bytes):
         code, phrase = super().status_resolution(request, response_body)
-        # additional resolution for checking method allowance
+        if request is None:
+            # request is invalid no need to check for method allowance
+            return code, phrase
         allowed = self.get_allowed_requests(request.requested_url.path)
         if request.method.decode() not in allowed:
             code = http.HTTPStatus.METHOD_NOT_ALLOWED.value
@@ -376,26 +434,27 @@ class WebServer(HttpServer):
         return self.loc_resource[request.requested_url.path][0], filename
 
     async def handle_response(self, request):
-        # look up the action table
-        # action is None if none is found for the path
-        action = self.action_callback.get(
-            request.requested_url.path, None)
-        action_result = None
-        if action:
-            try:
-                action_result = action(request)
-            except:
-                self.logger.warning(f"could not call action {action}")
-                action_result = None
+        body = None
+        filename = None
+        
+        # request is valid?
+        if request:
+            # look up the action table
+            # action is None if none is found for the path
+            action = self.action_callback.get(
+                request.requested_url.path, None)
+            action_result = None
+            if action:
+                try:
+                    action_result = action(request)
+                except:
+                    self.logger.warning(f"could not call action {action}")
+                    action_result = None
 
-        if (resources := self.resource_resolution(request)):
-            body, filename = resources
-            # action result is overriding mapping?
-            body = action_result if action_result is not None else body
-        else:
-            if resources is None:
-                body = None
-                filename = None
+            if (resources := self.resource_resolution(request)):
+                body, filename = resources
+                # action result is overriding mapping?
+                body = action_result if action_result is not None else body
 
         response = self.construct_response(
             request, filename=filename, body=body)
@@ -403,6 +462,8 @@ class WebServer(HttpServer):
 
     def prepare_headers(self, request, response):
         super().prepare_headers(request, response)
+        if not request:
+            return
         # edit the allow field
         response.headers["Allow"] = ", ".join(self.get_allowed_requests(
             request.requested_url.path))
@@ -429,6 +490,16 @@ def main():
                 </html>
                 """.encode()
 
+    def greet2(request: HTTPRequest):
+        if request.method == b"POST":
+            q = request.body
+            return f"""
+                <!DOCTYPE html>
+                <html>
+                <h1> Welcome to Free-HTTP-Server {q['fname']} {q['lname']}! </h1>
+                </html>
+                """.encode()
+
     loc_mapping = {
         "/": (b"""
         <!DOCTYPE html>
@@ -436,18 +507,40 @@ def main():
         <h1> Welcome to Free-HTTP-Server! </h1>
         <p> This is a minimalistic HTTP server implementation in Python. Enjoy your stay! </p>
         </html>
-        """, 'GET'),
+        """, ['GET']),
         "/hello_world": (b"""
         <!DOCTYPE html>
         <html>
         <h1> Welcome to Free-HTTP-Server! </h1>
         <p> Hello world! </p>
         </html>
-        """, 'GET')
+        """, ['GET']),
+
+        "/textarea-example": (b"""
+        <!DOCTYPE html>
+        <html>
+            <h1> HTML Textarea example </h1>
+            <form method="POST">
+                <label for="fname">First name:</label><br>
+                <input type="text" id="fname" name="fname"><br>
+                <label for="lname">Last name:</label><br>
+                <input type="text" id="lname" name="lname">
+                <input type="submit" value="send POST!">
+            </form> 
+        </html>
+        """, ['GET', 'POST']),
+        "/hello_world": (b"""
+        <!DOCTYPE html>
+        <html>
+        <h1> Welcome to Free-HTTP-Server! </h1>
+        <p> Hello world! </p>
+        </html>
+        """, ['GET'])
     }
     server = WebServer(port=31331, logging=True, debug=True,
                        root_dir="./www", loc_mapping=loc_mapping)
     server.attach_action('/', greet)
+    server.attach_action('/textarea-example', greet2)
     server.run()
 
 
